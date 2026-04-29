@@ -10,7 +10,7 @@ import json
 import os
 import time
 
-DISCORD_BOT_TOKEN = "some_token"
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 LOCATION_ZIP = "40313"
 RADIUS_KM = "60"
