@@ -827,6 +827,8 @@ async def stats(ctx, member: discord.Member = None):
     worst_text = f"{worst['name']} ({worst['profit']:+} Kč)" if worst else "Zatím nic"
 
     await ctx.send(
+
+        
         f"📊 **Stats — {target.display_name}**\n\n"
         f"🏷️ Level: **{stats_data['level']}**\n"
         f"💰 Celkový profit: **{stats_data['total_profit']:+} Kč**\n"
@@ -844,7 +846,7 @@ async def stats(ctx, member: discord.Member = None):
         
     )
     
-await update_user_role(ctx, stats_data["total_profit"])
+    await update_user_role(ctx, stats_data["total_profit"])
 
 @bot.command()
 async def best(ctx):
