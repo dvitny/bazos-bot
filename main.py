@@ -15,9 +15,7 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 LOCATION_ZIP = "40313"
 RADIUS_KM = "60"
 
-WATCH_FILE = "watchlist.json"
-SEEN_FILE = "seen.json"
-BLACKLIST_FILE = "blacklist.json"
+USERS_FILE = "users.json"
 FLIPS_FILE = "flips.json"
 
 CHECK_EVERY_MINUTES = 5
@@ -50,7 +48,13 @@ def load_json(path, default):
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        if not isinstance(data, type(default)):
+            save_json(path, default)
+            return default
+
+        return data
     except Exception:
         save_json(path, default)
         return default
@@ -59,6 +63,52 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# -------------------------
+# USER SETTINGS
+# -------------------------
+
+def load_users():
+    return load_json(USERS_FILE, {})
+
+
+def save_users(data):
+    save_json(USERS_FILE, data)
+
+
+def get_user_id(ctx):
+    return str(ctx.author.id)
+
+
+def get_user_name(ctx):
+    return ctx.author.display_name
+
+
+def ensure_user_settings(user_id, username):
+    users = load_users()
+
+    if user_id not in users:
+        users[user_id] = {
+            "username": username,
+            "watchlist": [],
+            "blacklist": DEFAULT_BLACKLIST.copy(),
+            "seen": []
+        }
+
+    users[user_id]["username"] = username
+
+    if "watchlist" not in users[user_id] or not isinstance(users[user_id]["watchlist"], list):
+        users[user_id]["watchlist"] = []
+
+    if "blacklist" not in users[user_id] or not isinstance(users[user_id]["blacklist"], list):
+        users[user_id]["blacklist"] = DEFAULT_BLACKLIST.copy()
+
+    if "seen" not in users[user_id] or not isinstance(users[user_id]["seen"], list):
+        users[user_id]["seen"] = []
+
+    save_users(users)
+    return users[user_id]
 
 
 # -------------------------
@@ -77,13 +127,8 @@ def normalize(text):
     return text.lower().strip()
 
 
-def get_blacklist():
-    return load_json(BLACKLIST_FILE, DEFAULT_BLACKLIST)
-
-
-def contains_blocked_words(text):
+def contains_blocked_words(text, blacklist):
     text_l = normalize(text)
-    blacklist = get_blacklist()
     return any(word.lower() in text_l for word in blacklist)
 
 
@@ -107,7 +152,7 @@ def get_deal_score(price, safe_sell_price, profit, min_profit):
     return round(min(score, 10), 1)
 
 
-def search_bazos(keyword, max_price, limit=50):
+def search_bazos(keyword, max_price, blacklist, limit=50):
     url = (
         f"https://www.bazos.cz/search.php?"
         f"hledat={quote_plus(keyword)}"
@@ -154,7 +199,7 @@ def search_bazos(keyword, max_price, limit=50):
 
         full_text = f"{title} {description}"
 
-        if contains_blocked_words(full_text):
+        if contains_blocked_words(full_text, blacklist):
             continue
 
         if not title_matches(title, keyword):
@@ -210,7 +255,7 @@ async def send_deal(channel, deal):
 
 
 # -------------------------
-# FLIPPING GAME HELPERS
+# FLIPPING GAME
 # -------------------------
 
 def load_flips():
@@ -221,15 +266,7 @@ def save_flips(data):
     save_json(FLIPS_FILE, data)
 
 
-def get_user_id(ctx):
-    return str(ctx.author.id)
-
-
-def get_user_name(ctx):
-    return ctx.author.display_name
-
-
-def ensure_user(data, user_id, username):
+def ensure_flip_user(data, user_id, username):
     if user_id not in data:
         data[user_id] = {
             "username": username,
@@ -237,6 +274,10 @@ def ensure_user(data, user_id, username):
         }
 
     data[user_id]["username"] = username
+
+    if "items" not in data[user_id] or not isinstance(data[user_id]["items"], list):
+        data[user_id]["items"] = []
+
     return data[user_id]
 
 
@@ -255,11 +296,10 @@ def get_level(total_profit):
 def get_user_stats(user):
     items = user.get("items", [])
 
-    bought_items = items
     sold_items = [item for item in items if item.get("status") == "sold"]
     holding_items = [item for item in items if item.get("status") == "holding"]
 
-    total_spent = sum(item.get("buy_price", 0) for item in bought_items)
+    total_spent = sum(item.get("buy_price", 0) for item in items)
     money_in_stock = sum(item.get("buy_price", 0) for item in holding_items)
     total_revenue = sum(item.get("sell_price", 0) or 0 for item in sold_items)
     total_profit = sum(item.get("profit", 0) or 0 for item in sold_items)
@@ -278,7 +318,7 @@ def get_user_stats(user):
         "total_profit": total_profit,
         "avg_profit": avg_profit,
         "win_rate": win_rate,
-        "bought_count": len(bought_items),
+        "bought_count": len(items),
         "sold_count": len(sold_items),
         "holding_count": len(holding_items),
         "best_flip": best_flip,
@@ -310,9 +350,7 @@ def find_holding_item(user, query):
 async def on_ready():
     print(f"Bot běží jako {bot.user}")
 
-    load_json(WATCH_FILE, [])
-    load_json(SEEN_FILE, [])
-    load_json(BLACKLIST_FILE, DEFAULT_BLACKLIST)
+    load_json(USERS_FILE, {})
     load_json(FLIPS_FILE, {})
 
     if not auto_scan.is_running():
@@ -346,6 +384,10 @@ async def helpbot(ctx):
         '`!watch "název" max_koupě prodej min_profit`\n'
         "`!watchlist`\n"
         "`!unwatch číslo`\n\n"
+        "**Personal settings:**\n"
+        "`!blacklist`\n"
+        "`!blacklist add slovo`\n"
+        "`!blacklist remove slovo`\n\n"
         "**Flipping game:**\n"
         '`!buy "název itemu" cena`\n'
         '`!sell "název itemu" cena`\n'
@@ -356,8 +398,6 @@ async def helpbot(ctx):
         "**Ostatní:**\n"
         "`!profit koupě prodej`\n"
         "`!msg cena`\n"
-        "`!blacklist add slovo`\n"
-        "`!blacklist remove slovo`\n"
         "`!clear 50`"
     )
 
@@ -386,9 +426,12 @@ async def find(ctx, *, args):
         expected_sell_price = int(parts[2])
         min_profit = int(parts[3])
 
-        await ctx.send(f"🔎 Hledám: **{keyword}**")
+        user_settings = ensure_user_settings(get_user_id(ctx), get_user_name(ctx))
+        blacklist = user_settings["blacklist"]
 
-        ads = await asyncio.to_thread(search_bazos, keyword, max_buy_price)
+        await ctx.send(f"🔎 Hledám pro **{ctx.author.display_name}**: **{keyword}**")
+
+        ads = await asyncio.to_thread(search_bazos, keyword, max_buy_price, blacklist)
         good_deals = filter_good_deals(ads, expected_sell_price, min_profit)
 
         if not good_deals:
@@ -422,7 +465,9 @@ async def watch(ctx, *, args):
         expected_sell_price = int(parts[2])
         min_profit = int(parts[3])
 
-        watchlist = load_json(WATCH_FILE, [])
+        users = load_users()
+        user_id = get_user_id(ctx)
+        user_settings = ensure_user_settings(user_id, get_user_name(ctx))
 
         item = {
             "keyword": keyword,
@@ -433,11 +478,12 @@ async def watch(ctx, *, args):
             "created_at": int(time.time())
         }
 
-        watchlist.append(item)
-        save_json(WATCH_FILE, watchlist)
+        user_settings["watchlist"].append(item)
+        users[user_id] = user_settings
+        save_users(users)
 
         await ctx.send(
-            f"✅ Přidáno do hlídání:\n"
+            f"✅ Přidáno do **tvého** watchlistu:\n"
             f"**{keyword}** | max {max_buy_price} Kč | prodej {expected_sell_price} Kč | min profit {min_profit} Kč"
         )
 
@@ -447,27 +493,35 @@ async def watch(ctx, *, args):
 
 @bot.command()
 async def unwatch(ctx, index: int):
-    watchlist = load_json(WATCH_FILE, [])
+    users = load_users()
+    user_id = get_user_id(ctx)
+    user_settings = ensure_user_settings(user_id, get_user_name(ctx))
+
+    watchlist = user_settings["watchlist"]
 
     if index < 1 or index > len(watchlist):
         await ctx.send("Špatné číslo. Použij `!watchlist`.")
         return
 
     removed = watchlist.pop(index - 1)
-    save_json(WATCH_FILE, watchlist)
 
-    await ctx.send(f"🗑️ Odebráno: **{removed['keyword']}**")
+    user_settings["watchlist"] = watchlist
+    users[user_id] = user_settings
+    save_users(users)
+
+    await ctx.send(f"🗑️ Odebráno z **tvého** watchlistu: **{removed['keyword']}**")
 
 
 @bot.command()
 async def watchlist(ctx):
-    watchlist = load_json(WATCH_FILE, [])
+    user_settings = ensure_user_settings(get_user_id(ctx), get_user_name(ctx))
+    watchlist = user_settings["watchlist"]
 
     if not watchlist:
-        await ctx.send("Watchlist je prázdný.")
+        await ctx.send("Tvůj watchlist je prázdný.")
         return
 
-    msg = "**📋 Watchlist:**\n\n"
+    msg = f"📋 **Watchlist — {ctx.author.display_name}**\n\n"
 
     for i, item in enumerate(watchlist, start=1):
         msg += (
@@ -476,6 +530,48 @@ async def watchlist(ctx):
             f"Prodej: {item['expected_sell_price']} Kč | "
             f"Min profit: {item['min_profit']} Kč\n\n"
         )
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def blacklist(ctx, action=None, *, word=None):
+    users = load_users()
+    user_id = get_user_id(ctx)
+    user_settings = ensure_user_settings(user_id, get_user_name(ctx))
+    words = user_settings["blacklist"]
+
+    if action == "add" and word:
+        word = word.lower().strip()
+
+        if word not in words:
+            words.append(word)
+
+        user_settings["blacklist"] = words
+        users[user_id] = user_settings
+        save_users(users)
+
+        await ctx.send(f"✅ Přidáno do **tvého** blacklistu: **{word}**")
+        return
+
+    if action == "remove" and word:
+        word = word.lower().strip()
+
+        if word in words:
+            words.remove(word)
+
+        user_settings["blacklist"] = words
+        users[user_id] = user_settings
+        save_users(users)
+
+        await ctx.send(f"🗑️ Odebráno z **tvého** blacklistu: **{word}**")
+        return
+
+    msg = f"🚫 **Blacklist — {ctx.author.display_name}**\n"
+    msg += ", ".join(words[:80])
+
+    if len(words) > 80:
+        msg += f"\n...a dalších {len(words) - 80}"
 
     await ctx.send(msg)
 
@@ -507,39 +603,6 @@ async def msg(ctx, price: int):
         f"Dobrý den, měl bych zájem. Bylo by možné to nechat za {price} Kč? "
         f"Můžu přijet osobně a vyzvednout co nejdřív."
     )
-
-
-@bot.command()
-async def blacklist(ctx, action=None, *, word=None):
-    words = load_json(BLACKLIST_FILE, DEFAULT_BLACKLIST)
-
-    if action == "add" and word:
-        word = word.lower().strip()
-
-        if word not in words:
-            words.append(word)
-            save_json(BLACKLIST_FILE, words)
-
-        await ctx.send(f"✅ Přidáno do blacklistu: **{word}**")
-        return
-
-    if action == "remove" and word:
-        word = word.lower().strip()
-
-        if word in words:
-            words.remove(word)
-            save_json(BLACKLIST_FILE, words)
-
-        await ctx.send(f"🗑️ Odebráno z blacklistu: **{word}**")
-        return
-
-    msg = "**🚫 Blacklist slova:**\n"
-    msg += ", ".join(words[:80])
-
-    if len(words) > 80:
-        msg += f"\n...a dalších {len(words) - 80}"
-
-    await ctx.send(msg)
 
 
 @bot.command()
@@ -582,7 +645,7 @@ async def buy(ctx, *, args):
         buy_price = int(parts[1])
 
         data = load_flips()
-        user = ensure_user(data, get_user_id(ctx), get_user_name(ctx))
+        user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
 
         item = {
             "name": name,
@@ -621,7 +684,7 @@ async def sell(ctx, *, args):
         sell_price = int(parts[1])
 
         data = load_flips()
-        user = ensure_user(data, get_user_id(ctx), get_user_name(ctx))
+        user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
 
         item = find_holding_item(user, name)
 
@@ -658,7 +721,7 @@ async def sell(ctx, *, args):
 @bot.command()
 async def inventory(ctx):
     data = load_flips()
-    user = ensure_user(data, get_user_id(ctx), get_user_name(ctx))
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
 
     holding = [item for item in user.get("items", []) if item.get("status") == "holding"]
 
@@ -696,15 +759,8 @@ async def stats(ctx, member: discord.Member = None):
     best = stats_data["best_flip"]
     worst = stats_data["worst_flip"]
 
-    best_text = (
-        f"{best['name']} ({best['profit']:+} Kč)"
-        if best else "Zatím nic"
-    )
-
-    worst_text = (
-        f"{worst['name']} ({worst['profit']:+} Kč)"
-        if worst else "Zatím nic"
-    )
+    best_text = f"{best['name']} ({best['profit']:+} Kč)" if best else "Zatím nic"
+    worst_text = f"{worst['name']} ({worst['profit']:+} Kč)" if worst else "Zatím nic"
 
     await ctx.send(
         f"📊 **Stats — {target.display_name}**\n\n"
@@ -792,7 +848,7 @@ async def history(ctx, member: discord.Member = None):
 @bot.command()
 async def removeitem(ctx, index: int):
     data = load_flips()
-    user = ensure_user(data, get_user_id(ctx), get_user_name(ctx))
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
 
     holding = [item for item in user.get("items", []) if item.get("status") == "holding"]
 
@@ -813,45 +869,56 @@ async def removeitem(ctx, index: int):
 
 @tasks.loop(minutes=CHECK_EVERY_MINUTES)
 async def auto_scan():
-    watchlist = load_json(WATCH_FILE, [])
-    seen = set(load_json(SEEN_FILE, []))
+    users = load_users()
 
-    if not watchlist:
+    if not users:
         return
 
     print("Auto scan běží...")
 
-    for item in watchlist:
-        channel = bot.get_channel(item["channel_id"])
+    for user_id, user_settings in users.items():
+        watchlist = user_settings.get("watchlist", [])
+        blacklist = user_settings.get("blacklist", DEFAULT_BLACKLIST.copy())
+        seen = set(user_settings.get("seen", []))
 
-        if channel is None:
+        if not watchlist:
             continue
 
-        try:
-            ads = await asyncio.to_thread(
-                search_bazos,
-                item["keyword"],
-                item["max_buy_price"]
-            )
+        for item in watchlist:
+            channel = bot.get_channel(item["channel_id"])
 
-            good_deals = filter_good_deals(
-                ads,
-                item["expected_sell_price"],
-                item["min_profit"]
-            )
+            if channel is None:
+                continue
 
-            for deal in good_deals:
-                if deal["link"] in seen:
-                    continue
+            try:
+                ads = await asyncio.to_thread(
+                    search_bazos,
+                    item["keyword"],
+                    item["max_buy_price"],
+                    blacklist
+                )
 
-                seen.add(deal["link"])
-                save_json(SEEN_FILE, list(seen))
+                good_deals = filter_good_deals(
+                    ads,
+                    item["expected_sell_price"],
+                    item["min_profit"]
+                )
 
-                await send_deal(channel, deal)
-                await asyncio.sleep(1)
+                for deal in good_deals:
+                    if deal["link"] in seen:
+                        continue
 
-        except Exception as e:
-            print(f"Auto scan chyba u {item['keyword']}: {e}")
+                    seen.add(deal["link"])
+                    user_settings["seen"] = list(seen)
+                    users[user_id] = user_settings
+                    save_users(users)
+
+                    await channel.send(f"<@{user_id}> 🔥 nový deal podle tvého watchlistu:")
+                    await send_deal(channel, deal)
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                print(f"Auto scan chyba u usera {user_id}, item {item['keyword']}: {e}")
 
 
 # -------------------------
