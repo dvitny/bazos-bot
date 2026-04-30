@@ -41,6 +41,45 @@ DEFAULT_BLACKLIST = [
 # JSON HELPERS
 # -------------------------
 
+async def update_user_role(ctx, total_profit):
+    guild = ctx.guild
+    if guild is None:
+        return
+
+    roles_map = [
+        (20000, "👑 Shark"),
+        (10000, "💎 Profit Boss"),
+        (5000, "🔥 Flipper"),
+        (1000, "⚡ Deal Hunter"),
+        (0, "🌱 Rookie"),
+    ]
+
+    member = ctx.author
+
+    target_role_name = None
+    for threshold, role_name in roles_map:
+        if total_profit >= threshold:
+            target_role_name = role_name
+            break
+
+    if not target_role_name:
+        return
+
+    role = discord.utils.get(guild.roles, name=target_role_name)
+
+    if role is None:
+        return
+
+    # odeber staré role
+    for _, role_name in roles_map:
+        r = discord.utils.get(guild.roles, name=role_name)
+        if r in member.roles and r != role:
+            await member.remove_roles(r)
+
+    # přidej novou
+    if role not in member.roles:
+        await member.add_roles(role)
+
 def load_json(path, default):
     if not os.path.exists(path):
         save_json(path, default)
@@ -717,6 +756,31 @@ async def sell(ctx, *, args):
     except Exception as e:
         await ctx.send(f"Chyba: `{e}`")
 
+@bot.command()
+async def losses(ctx):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    sold = [i for i in user["items"] if i["status"] == "sold"]
+
+    losses = [i for i in sold if i["profit"] < 0]
+
+    if not losses:
+        await ctx.send("Nemáš žádné ztrátové flipy 🔥")
+        return
+
+    losses.sort(key=lambda x: x["profit"])
+
+    msg = f"💀 **Ztrátové flipy — {ctx.author.display_name}**\n\n"
+
+    for item in losses[:5]:
+        msg += (
+            f"**{item['name']}**\n"
+            f"{item['buy_price']} → {item['sell_price']} Kč "
+            f"(**{item['profit']} Kč**)\n\n"
+        )
+
+    await ctx.send(msg)
 
 @bot.command()
 async def inventory(ctx):
@@ -776,8 +840,35 @@ async def stats(ctx, member: discord.Member = None):
         f"🏆 Win rate: **{stats_data['win_rate']}%**\n"
         f"🔥 Největší flip: **{best_text}**\n"
         f"📉 Nejhorší flip: **{worst_text}**"
-    )
 
+        
+    )
+    
+await update_user_role(ctx, stats_data["total_profit"])
+
+@bot.command()
+async def best(ctx):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    sold = [i for i in user["items"] if i["status"] == "sold"]
+
+    if not sold:
+        await ctx.send("Nemáš žádné prodané itemy.")
+        return
+
+    sold.sort(key=lambda x: x["profit"], reverse=True)
+
+    msg = f"🏆 **Top flipy — {ctx.author.display_name}**\n\n"
+
+    for item in sold[:3]:
+        msg += (
+            f"**{item['name']}**\n"
+            f"{item['buy_price']} → {item['sell_price']} Kč "
+            f"(**{item['profit']:+} Kč**)\n\n"
+        )
+
+    await ctx.send(msg)
 
 @bot.command()
 async def leaderboard(ctx):
