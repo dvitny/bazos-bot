@@ -19,6 +19,7 @@ USERS_FILE = "users.json"
 FLIPS_FILE = "flips.json"
 
 CHECK_EVERY_MINUTES = 5
+ADMIN_CHANNEL_NAME = "🔒・admin"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -36,49 +37,6 @@ DEFAULT_BLACKLIST = [
     "držák", "drzak", "adaptér", "adapter", "kabel",
 ]
 
-
-# -------------------------
-# JSON HELPERS
-# -------------------------
-
-async def update_user_role(ctx, total_profit):
-    guild = ctx.guild
-    if guild is None:
-        return
-
-    roles_map = [
-        (20000, "👑 Shark"),
-        (10000, "💎 Profit Boss"),
-        (5000, "🔥 Flipper"),
-        (1000, "⚡ Deal Hunter"),
-        (0, "🌱 Rookie"),
-    ]
-
-    member = ctx.author
-
-    target_role_name = None
-    for threshold, role_name in roles_map:
-        if total_profit >= threshold:
-            target_role_name = role_name
-            break
-
-    if not target_role_name:
-        return
-
-    role = discord.utils.get(guild.roles, name=target_role_name)
-
-    if role is None:
-        return
-
-    # odeber staré role
-    for _, role_name in roles_map:
-        r = discord.utils.get(guild.roles, name=role_name)
-        if r in member.roles and r != role:
-            await member.remove_roles(r)
-
-    # přidej novou
-    if role not in member.roles:
-        await member.add_roles(role)
 
 def load_json(path, default):
     if not os.path.exists(path):
@@ -104,16 +62,20 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# -------------------------
-# USER SETTINGS
-# -------------------------
-
 def load_users():
     return load_json(USERS_FILE, {})
 
 
 def save_users(data):
     save_json(USERS_FILE, data)
+
+
+def load_flips():
+    return load_json(FLIPS_FILE, {})
+
+
+def save_flips(data):
+    save_json(FLIPS_FILE, data)
 
 
 def get_user_id(ctx):
@@ -136,23 +98,29 @@ def ensure_user_settings(user_id, username):
         }
 
     users[user_id]["username"] = username
-
-    if "watchlist" not in users[user_id] or not isinstance(users[user_id]["watchlist"], list):
-        users[user_id]["watchlist"] = []
-
-    if "blacklist" not in users[user_id] or not isinstance(users[user_id]["blacklist"], list):
-        users[user_id]["blacklist"] = DEFAULT_BLACKLIST.copy()
-
-    if "seen" not in users[user_id] or not isinstance(users[user_id]["seen"], list):
-        users[user_id]["seen"] = []
+    users[user_id].setdefault("watchlist", [])
+    users[user_id].setdefault("blacklist", DEFAULT_BLACKLIST.copy())
+    users[user_id].setdefault("seen", [])
 
     save_users(users)
     return users[user_id]
 
 
-# -------------------------
-# BAZOS HELPERS
-# -------------------------
+def ensure_flip_user(data, user_id, username):
+    if user_id not in data:
+        data[user_id] = {
+            "username": username,
+            "items": []
+        }
+
+    data[user_id]["username"] = username
+    data[user_id].setdefault("items", [])
+    return data[user_id]
+
+
+def normalize(text):
+    return text.lower().strip()
+
 
 def extract_price(text):
     text = text.replace("\xa0", " ")
@@ -160,10 +128,6 @@ def extract_price(text):
     if not match:
         return None
     return int(match.group(1).replace(" ", ""))
-
-
-def normalize(text):
-    return text.lower().strip()
 
 
 def contains_blocked_words(text, blacklist):
@@ -210,7 +174,6 @@ def search_bazos(keyword, max_price, blacklist, limit=50):
 
     soup = BeautifulSoup(response.text, "html.parser")
     ads = soup.select(".inzeraty")
-
     results = []
 
     for ad in ads[:limit]:
@@ -279,7 +242,7 @@ def filter_good_deals(ads, expected_sell_price, min_profit):
 
 
 async def send_deal(channel, deal):
-    message = (
+    await channel.send(
         f"🔥 **DEAL {deal['score']}/10**\n\n"
         f"**{deal['title']}**\n"
         f"Cena: **{deal['price']} Kč**\n"
@@ -290,46 +253,100 @@ async def send_deal(channel, deal):
         f"{deal['link']}"
     )
 
-    await channel.send(message)
+
+def make_item_id():
+    return str(int(time.time() * 1000))
 
 
-# -------------------------
-# FLIPPING GAME
-# -------------------------
-
-def load_flips():
-    return load_json(FLIPS_FILE, {})
-
-
-def save_flips(data):
-    save_json(FLIPS_FILE, data)
+def find_item_by_id(user, item_id):
+    for item in user.get("items", []):
+        if str(item.get("id")) == str(item_id):
+            return item
+    return None
 
 
-def ensure_flip_user(data, user_id, username):
-    if user_id not in data:
-        data[user_id] = {
-            "username": username,
-            "items": []
-        }
+def find_holding_item(user, query):
+    query_l = normalize(query)
+    items = user.get("items", [])
 
-    data[user_id]["username"] = username
+    candidates = [
+        item for item in items
+        if item.get("status") == "holding"
+    ]
 
-    if "items" not in data[user_id] or not isinstance(data[user_id]["items"], list):
-        data[user_id]["items"] = []
+    exact = [
+        item for item in candidates
+        if normalize(item.get("name", "")) == query_l
+    ]
 
-    return data[user_id]
+    if exact:
+        return exact[0]
+
+    partial = [
+        item for item in candidates
+        if query_l in normalize(item.get("name", ""))
+    ]
+
+    if partial:
+        return partial[0]
+
+    return None
+
+
+def get_admin_channel(guild):
+    if guild is None:
+        return None
+    return discord.utils.get(guild.text_channels, name=ADMIN_CHANNEL_NAME)
 
 
 def get_level(total_profit):
     if total_profit >= 20000:
-        return "👑 Ústecký Shark"
+        return "👑 Shark"
     if total_profit >= 10000:
         return "💎 Profit Boss"
     if total_profit >= 5000:
-        return "🔥 Marketplace Demon"
+        return "🔥 Flipper"
     if total_profit >= 1000:
         return "⚡ Deal Hunter"
-    return "🌱 Rookie Flipper"
+    return "🌱 Rookie"
+
+
+async def update_user_role(ctx, total_profit):
+    guild = ctx.guild
+    if guild is None:
+        return
+
+    roles_map = [
+        (20000, "👑 Shark"),
+        (10000, "💎 Profit Boss"),
+        (5000, "🔥 Flipper"),
+        (1000, "⚡ Deal Hunter"),
+        (0, "🌱 Rookie"),
+    ]
+
+    target_role_name = None
+
+    for threshold, role_name in roles_map:
+        if total_profit >= threshold:
+            target_role_name = role_name
+            break
+
+    if not target_role_name:
+        return
+
+    target_role = discord.utils.get(guild.roles, name=target_role_name)
+    if target_role is None:
+        return
+
+    member = ctx.author
+
+    for _, role_name in roles_map:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role and role in member.roles and role != target_role:
+            await member.remove_roles(role)
+
+    if target_role not in member.roles:
+        await member.add_roles(target_role)
 
 
 def get_user_stats(user):
@@ -337,6 +354,7 @@ def get_user_stats(user):
 
     sold_items = [item for item in items if item.get("status") == "sold"]
     holding_items = [item for item in items if item.get("status") == "holding"]
+    pending_items = [item for item in items if item.get("status") == "pending"]
 
     total_spent = sum(item.get("buy_price", 0) for item in items)
     money_in_stock = sum(item.get("buy_price", 0) for item in holding_items)
@@ -360,30 +378,12 @@ def get_user_stats(user):
         "bought_count": len(items),
         "sold_count": len(sold_items),
         "holding_count": len(holding_items),
+        "pending_count": len(pending_items),
         "best_flip": best_flip,
         "worst_flip": worst_flip,
         "level": get_level(total_profit)
     }
 
-
-def find_holding_item(user, query):
-    query_l = normalize(query)
-    holding = [item for item in user.get("items", []) if item.get("status") == "holding"]
-
-    exact = [item for item in holding if normalize(item.get("name", "")) == query_l]
-    if exact:
-        return exact[0]
-
-    partial = [item for item in holding if query_l in normalize(item.get("name", ""))]
-    if partial:
-        return partial[0]
-
-    return None
-
-
-# -------------------------
-# EVENTS
-# -------------------------
 
 @bot.event
 async def on_ready():
@@ -405,10 +405,6 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-# -------------------------
-# BASIC COMMANDS
-# -------------------------
-
 @bot.command()
 async def test(ctx):
     await ctx.send("funguje")
@@ -429,21 +425,23 @@ async def helpbot(ctx):
         "`!blacklist remove slovo`\n\n"
         "**Flipping game:**\n"
         '`!buy "název itemu" cena`\n'
-        '`!sell "název itemu" cena`\n'
+        '`!sell "název itemu" cena + screenshot/link`\n'
         "`!inventory`\n"
         "`!stats`\n"
         "`!leaderboard`\n"
-        "`!history`\n\n"
+        "`!history`\n"
+        "`!best`\n"
+        "`!losses`\n\n"
+        "**Admin:**\n"
+        "`!pending`\n"
+        "`!approve USER_ID ITEM_ID`\n"
+        "`!reject USER_ID ITEM_ID`\n\n"
         "**Ostatní:**\n"
         "`!profit koupě prodej`\n"
         "`!msg cena`\n"
         "`!clear 50`"
     )
 
-
-# -------------------------
-# BAZOS COMMANDS
-# -------------------------
 
 @bot.command()
 async def find(ctx, *, args):
@@ -453,10 +451,7 @@ async def find(ctx, *, args):
         if len(parts) < 4:
             await ctx.send(
                 "Použití:\n"
-                '`!find "logitech g pro superlight" 1200 1700 400`\n\n'
-                "1200 = max koupit\n"
-                "1700 = za kolik to reálně prodáš\n"
-                "400 = minimální profit"
+                '`!find "logitech g pro superlight" 1200 1700 400`'
             )
             return
 
@@ -493,10 +488,7 @@ async def watch(ctx, *, args):
         parts = shlex.split(args)
 
         if len(parts) < 4:
-            await ctx.send(
-                "Použití:\n"
-                '`!watch "logitech g pro superlight" 1200 1700 400`'
-            )
+            await ctx.send('Použití: `!watch "logitech g pro superlight" 1200 1700 400`')
             return
 
         keyword = parts[0]
@@ -523,7 +515,8 @@ async def watch(ctx, *, args):
 
         await ctx.send(
             f"✅ Přidáno do **tvého** watchlistu:\n"
-            f"**{keyword}** | max {max_buy_price} Kč | prodej {expected_sell_price} Kč | min profit {min_profit} Kč"
+            f"**{keyword}** | max {max_buy_price} Kč | "
+            f"prodej {expected_sell_price} Kč | min profit {min_profit} Kč"
         )
 
     except Exception as e:
@@ -543,7 +536,6 @@ async def unwatch(ctx, index: int):
         return
 
     removed = watchlist.pop(index - 1)
-
     user_settings["watchlist"] = watchlist
     users[user_id] = user_settings
     save_users(users)
@@ -615,9 +607,435 @@ async def blacklist(ctx, action=None, *, word=None):
     await ctx.send(msg)
 
 
-# -------------------------
-# TOOL COMMANDS
-# -------------------------
+@bot.command()
+async def buy(ctx, *, args):
+    try:
+        parts = shlex.split(args)
+
+        if len(parts) < 2:
+            await ctx.send('Použití: `!buy "Logitech Superlight" 1000`')
+            return
+
+        name = parts[0]
+        buy_price = int(parts[1])
+
+        data = load_flips()
+        user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+        item = {
+            "id": make_item_id(),
+            "name": name,
+            "buy_price": buy_price,
+            "sell_price": None,
+            "profit": None,
+            "status": "holding",
+            "proof": None,
+            "bought_at": int(time.time()),
+            "sold_at": None
+        }
+
+        user["items"].append(item)
+        save_flips(data)
+
+        await ctx.send(
+            f"📦 **Koupeno!**\n"
+            f"Item: **{name}**\n"
+            f"Cena: **{buy_price} Kč**\n\n"
+            f"Prodej zapíšeš takhle:\n"
+            f"`!sell \"{name}\" prodejní_cena` + přilož screenshot"
+        )
+
+    except Exception as e:
+        await ctx.send(f"Chyba: `{e}`")
+
+
+@bot.command()
+async def sell(ctx, *, args):
+    try:
+        parts = shlex.split(args)
+
+        if len(parts) < 2:
+            await ctx.send(
+                'Použití:\n'
+                '`!sell "Logitech Superlight" 1700 https://proof-link.com`\n\n'
+                "Nebo přilož screenshot jako attachment."
+            )
+            return
+
+        name = parts[0]
+        sell_price = int(parts[1])
+        proof_link = parts[2] if len(parts) >= 3 else None
+
+        if ctx.message.attachments:
+            proof_link = ctx.message.attachments[0].url
+
+        if not proof_link:
+            await ctx.send("❌ Musíš přidat důkaz — link nebo screenshot jako attachment.")
+            return
+
+        data = load_flips()
+        user_id = get_user_id(ctx)
+        user = ensure_flip_user(data, user_id, get_user_name(ctx))
+        item = find_holding_item(user, name)
+
+        if not item:
+            await ctx.send(
+                f"Nemáš žádný aktivní item s názvem **{name}**.\n"
+                f"Použij `!inventory`."
+            )
+            return
+
+        if "id" not in item:
+            item["id"] = make_item_id()
+
+        pending_profit = sell_price - item["buy_price"]
+
+        item["status"] = "pending"
+        item["pending_sell_price"] = sell_price
+        item["pending_profit"] = pending_profit
+        item["proof"] = proof_link
+        item["pending_at"] = int(time.time())
+
+        save_flips(data)
+
+        await ctx.send(
+            f"🕒 **Prodej čeká na schválení adminem.**\n"
+            f"Item: **{item['name']}**\n"
+            f"Koupeno za: **{item['buy_price']} Kč**\n"
+            f"Prodej: **{sell_price} Kč**\n"
+            f"Pending profit: **{pending_profit:+} Kč**"
+        )
+
+        admin_channel = get_admin_channel(ctx.guild)
+
+        if admin_channel:
+            await admin_channel.send(
+                f"🧾 **NOVÝ PRODEJ KE SCHVÁLENÍ**\n\n"
+                f"User: {ctx.author.mention}\n"
+                f"User ID: `{user_id}`\n"
+                f"Item ID: `{item['id']}`\n\n"
+                f"Item: **{item['name']}**\n"
+                f"Koupeno za: **{item['buy_price']} Kč**\n"
+                f"Prodáno za: **{sell_price} Kč**\n"
+                f"Profit: **{pending_profit:+} Kč**\n\n"
+                f"Důkaz: {proof_link}\n\n"
+                f"✅ Schválit:\n"
+                f"`!approve {user_id} {item['id']}`\n\n"
+                f"❌ Zamítnout:\n"
+                f"`!reject {user_id} {item['id']}`"
+            )
+        else:
+            await ctx.send(f"⚠️ Admin kanál `{ADMIN_CHANNEL_NAME}` nebyl nalezen.")
+
+    except Exception as e:
+        await ctx.send(f"Chyba: `{e}`")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def approve(ctx, user_id: str, item_id: str):
+    data = load_flips()
+
+    if user_id not in data:
+        await ctx.send("User nenalezen.")
+        return
+
+    user = data[user_id]
+    item = find_item_by_id(user, item_id)
+
+    if not item:
+        await ctx.send("Item nenalezen.")
+        return
+
+    if item.get("status") != "pending":
+        await ctx.send("Tenhle item není pending.")
+        return
+
+    sell_price = item["pending_sell_price"]
+    profit = sell_price - item["buy_price"]
+
+    item["sell_price"] = sell_price
+    item["profit"] = profit
+    item["status"] = "sold"
+    item["sold_at"] = int(time.time())
+
+    item.pop("pending_sell_price", None)
+    item.pop("pending_profit", None)
+    item.pop("pending_at", None)
+
+    save_flips(data)
+
+    await ctx.send(
+        f"✅ **Prodej schválen!**\n"
+        f"User: **{user.get('username', 'Unknown')}**\n"
+        f"Item: **{item['name']}**\n"
+        f"Profit: **{profit:+} Kč**"
+    )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def reject(ctx, user_id: str, item_id: str):
+    data = load_flips()
+
+    if user_id not in data:
+        await ctx.send("User nenalezen.")
+        return
+
+    user = data[user_id]
+    item = find_item_by_id(user, item_id)
+
+    if not item:
+        await ctx.send("Item nenalezen.")
+        return
+
+    if item.get("status") != "pending":
+        await ctx.send("Tenhle item není pending.")
+        return
+
+    item["status"] = "holding"
+    item.pop("pending_sell_price", None)
+    item.pop("pending_profit", None)
+    item.pop("pending_at", None)
+    item.pop("proof", None)
+
+    save_flips(data)
+
+    await ctx.send(
+        f"❌ **Prodej zamítnut.**\n"
+        f"User: **{user.get('username', 'Unknown')}**\n"
+        f"Item: **{item['name']}** se vrátil do inventory."
+    )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def pending(ctx):
+    data = load_flips()
+    msg = "🕒 **Pending prodeje:**\n\n"
+    found = False
+
+    for user_id, user in data.items():
+        for item in user.get("items", []):
+            if item.get("status") == "pending":
+                found = True
+                msg += (
+                    f"User: **{user.get('username', 'Unknown')}**\n"
+                    f"User ID: `{user_id}`\n"
+                    f"Item ID: `{item.get('id')}`\n"
+                    f"Item: **{item.get('name')}**\n"
+                    f"Profit: **{item.get('pending_profit'):+} Kč**\n"
+                    f"Proof: {item.get('proof')}\n\n"
+                )
+
+    if not found:
+        msg += "Nic nečeká na schválení."
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def inventory(ctx):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    active = [
+        item for item in user.get("items", [])
+        if item.get("status") in ["holding", "pending"]
+    ]
+
+    if not active:
+        await ctx.send("📦 Inventory je prázdný.")
+        return
+
+    msg = f"📦 **Inventory — {ctx.author.display_name}**\n\n"
+    total = 0
+
+    for i, item in enumerate(active, start=1):
+        total += item["buy_price"]
+        status = "🕒 pending" if item.get("status") == "pending" else "📦 holding"
+        msg += f"`{i}` — **{item['name']}** | {item['buy_price']} Kč | {status}\n"
+
+    msg += f"\n💼 Peníze ve zboží: **{total} Kč**"
+    await ctx.send(msg)
+
+
+@bot.command()
+async def stats(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    data = load_flips()
+    user_id = str(target.id)
+
+    if user_id not in data:
+        await ctx.send("Tenhle user ještě nemá žádné flipy.")
+        return
+
+    user = data[user_id]
+    stats_data = get_user_stats(user)
+
+    best = stats_data["best_flip"]
+    worst = stats_data["worst_flip"]
+
+    best_text = f"{best['name']} ({best['profit']:+} Kč)" if best else "Zatím nic"
+    worst_text = f"{worst['name']} ({worst['profit']:+} Kč)" if worst else "Zatím nic"
+
+    await ctx.send(
+        f"📊 **Stats — {target.display_name}**\n\n"
+        f"🏷️ Level: **{stats_data['level']}**\n"
+        f"💰 Celkový profit: **{stats_data['total_profit']:+} Kč**\n"
+        f"💸 Celkem utraceno: **{stats_data['total_spent']} Kč**\n"
+        f"💵 Celkové tržby: **{stats_data['total_revenue']} Kč**\n"
+        f"📦 Koupeno itemů: **{stats_data['bought_count']}**\n"
+        f"✅ Prodáno itemů: **{stats_data['sold_count']}**\n"
+        f"🕒 Čeká na schválení: **{stats_data['pending_count']}**\n"
+        f"⏳ Aktuálně drží: **{stats_data['holding_count']}**\n"
+        f"💼 Peníze ve zboží: **{stats_data['money_in_stock']} Kč**\n"
+        f"📈 Průměrný profit/item: **{stats_data['avg_profit']} Kč**\n"
+        f"🏆 Win rate: **{stats_data['win_rate']}%**\n"
+        f"🔥 Největší flip: **{best_text}**\n"
+        f"📉 Nejhorší flip: **{worst_text}**"
+    )
+
+    if target.id == ctx.author.id:
+        await update_user_role(ctx, stats_data["total_profit"])
+
+
+@bot.command()
+async def leaderboard(ctx):
+    data = load_flips()
+
+    if not data:
+        await ctx.send("Leaderboard je zatím prázdný.")
+        return
+
+    rows = []
+
+    for user_id, user in data.items():
+        stats_data = get_user_stats(user)
+        rows.append({
+            "username": user.get("username", "Unknown"),
+            "profit": stats_data["total_profit"],
+            "sold": stats_data["sold_count"],
+            "level": stats_data["level"]
+        })
+
+    rows.sort(key=lambda x: x["profit"], reverse=True)
+
+    msg = "🏆 **Flipping Leaderboard**\n\n"
+
+    for i, row in enumerate(rows[:10], start=1):
+        msg += (
+            f"`{i}` — **{row['username']}**\n"
+            f"Profit: **{row['profit']:+} Kč** | "
+            f"Sold: **{row['sold']}** | "
+            f"{row['level']}\n\n"
+        )
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def history(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    data = load_flips()
+    user_id = str(target.id)
+
+    if user_id not in data:
+        await ctx.send("Tenhle user ještě nemá historii.")
+        return
+
+    sold = [
+        item for item in data[user_id].get("items", [])
+        if item.get("status") == "sold"
+    ]
+
+    if not sold:
+        await ctx.send("Zatím žádné schválené prodeje.")
+        return
+
+    sold.sort(key=lambda x: x.get("sold_at", 0), reverse=True)
+
+    msg = f"🧾 **Historie prodejů — {target.display_name}**\n\n"
+
+    for item in sold[:10]:
+        msg += (
+            f"**{item['name']}**\n"
+            f"{item['buy_price']} Kč → {item['sell_price']} Kč "
+            f"(**{item['profit']:+} Kč**)\n\n"
+        )
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def best(ctx):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    sold = [i for i in user["items"] if i.get("status") == "sold"]
+
+    if not sold:
+        await ctx.send("Nemáš žádné schválené prodané itemy.")
+        return
+
+    sold.sort(key=lambda x: x.get("profit", 0), reverse=True)
+    msg = f"🏆 **Top flipy — {ctx.author.display_name}**\n\n"
+
+    for item in sold[:3]:
+        msg += (
+            f"**{item['name']}**\n"
+            f"{item['buy_price']} → {item['sell_price']} Kč "
+            f"(**{item['profit']:+} Kč**)\n\n"
+        )
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def losses(ctx):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    sold = [i for i in user["items"] if i.get("status") == "sold"]
+    losses_items = [i for i in sold if i.get("profit", 0) < 0]
+
+    if not losses_items:
+        await ctx.send("Nemáš žádné ztrátové flipy 🔥")
+        return
+
+    losses_items.sort(key=lambda x: x.get("profit", 0))
+    msg = f"💀 **Ztrátové flipy — {ctx.author.display_name}**\n\n"
+
+    for item in losses_items[:5]:
+        msg += (
+            f"**{item['name']}**\n"
+            f"{item['buy_price']} → {item['sell_price']} Kč "
+            f"(**{item['profit']} Kč**)\n\n"
+        )
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def removeitem(ctx, index: int):
+    data = load_flips()
+    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
+
+    active = [
+        item for item in user.get("items", [])
+        if item.get("status") in ["holding", "pending"]
+    ]
+
+    if index < 1 or index > len(active):
+        await ctx.send("Špatné číslo. Použij `!inventory`.")
+        return
+
+    item_to_remove = active[index - 1]
+    user["items"].remove(item_to_remove)
+    save_flips(data)
+
+    await ctx.send(f"🗑️ Odebráno z inventory: **{item_to_remove['name']}**")
+
 
 @bot.command()
 async def profit(ctx, buy_price: int, sell_price: int):
@@ -666,299 +1084,6 @@ async def clearall(ctx):
 
     await ctx.send(f"Smazáno {deleted} zpráv.", delete_after=3)
 
-
-# -------------------------
-# FLIPPING GAME COMMANDS
-# -------------------------
-
-@bot.command()
-async def buy(ctx, *, args):
-    try:
-        parts = shlex.split(args)
-
-        if len(parts) < 2:
-            await ctx.send('Použití: `!buy "Logitech Superlight" 1000`')
-            return
-
-        name = parts[0]
-        buy_price = int(parts[1])
-
-        data = load_flips()
-        user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-        item = {
-            "name": name,
-            "buy_price": buy_price,
-            "sell_price": None,
-            "profit": None,
-            "status": "holding",
-            "bought_at": int(time.time()),
-            "sold_at": None
-        }
-
-        user["items"].append(item)
-        save_flips(data)
-
-        await ctx.send(
-            f"📦 **Koupeno!**\n"
-            f"Item: **{name}**\n"
-            f"Cena: **{buy_price} Kč**\n\n"
-            f"Použij potom: `!sell \"{name}\" prodejní_cena`"
-        )
-
-    except Exception as e:
-        await ctx.send(f"Chyba: `{e}`")
-
-
-@bot.command()
-async def sell(ctx, *, args):
-    try:
-        parts = shlex.split(args)
-
-        if len(parts) < 2:
-            await ctx.send('Použití: `!sell "Logitech Superlight" 1700`')
-            return
-
-        name = parts[0]
-        sell_price = int(parts[1])
-
-        data = load_flips()
-        user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-        item = find_holding_item(user, name)
-
-        if not item:
-            await ctx.send(
-                f"Nemáš žádný aktivní item s názvem **{name}**.\n"
-                f"Použij `!inventory`."
-            )
-            return
-
-        profit = sell_price - item["buy_price"]
-
-        item["sell_price"] = sell_price
-        item["profit"] = profit
-        item["status"] = "sold"
-        item["sold_at"] = int(time.time())
-
-        save_flips(data)
-
-        emoji = "🔥" if profit > 0 else "💀"
-
-        await ctx.send(
-            f"{emoji} **Prodáno!**\n"
-            f"Item: **{item['name']}**\n"
-            f"Koupeno za: **{item['buy_price']} Kč**\n"
-            f"Prodáno za: **{sell_price} Kč**\n"
-            f"Profit: **{profit:+} Kč**"
-        )
-
-    except Exception as e:
-        await ctx.send(f"Chyba: `{e}`")
-
-@bot.command()
-async def losses(ctx):
-    data = load_flips()
-    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-    sold = [i for i in user["items"] if i["status"] == "sold"]
-
-    losses = [i for i in sold if i["profit"] < 0]
-
-    if not losses:
-        await ctx.send("Nemáš žádné ztrátové flipy 🔥")
-        return
-
-    losses.sort(key=lambda x: x["profit"])
-
-    msg = f"💀 **Ztrátové flipy — {ctx.author.display_name}**\n\n"
-
-    for item in losses[:5]:
-        msg += (
-            f"**{item['name']}**\n"
-            f"{item['buy_price']} → {item['sell_price']} Kč "
-            f"(**{item['profit']} Kč**)\n\n"
-        )
-
-    await ctx.send(msg)
-
-@bot.command()
-async def inventory(ctx):
-    data = load_flips()
-    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-    holding = [item for item in user.get("items", []) if item.get("status") == "holding"]
-
-    if not holding:
-        await ctx.send("📦 Inventory je prázdný.")
-        return
-
-    msg = f"📦 **Inventory — {ctx.author.display_name}**\n\n"
-
-    total = 0
-
-    for i, item in enumerate(holding, start=1):
-        total += item["buy_price"]
-        msg += f"`{i}` — **{item['name']}** | {item['buy_price']} Kč\n"
-
-    msg += f"\n💼 Peníze ve zboží: **{total} Kč**"
-
-    await ctx.send(msg)
-
-
-@bot.command()
-async def stats(ctx, member: discord.Member = None):
-    target = member or ctx.author
-
-    data = load_flips()
-    user_id = str(target.id)
-
-    if user_id not in data:
-        await ctx.send("Tenhle user ještě nemá žádné flipy.")
-        return
-
-    user = data[user_id]
-    stats_data = get_user_stats(user)
-
-    best = stats_data["best_flip"]
-    worst = stats_data["worst_flip"]
-
-    best_text = f"{best['name']} ({best['profit']:+} Kč)" if best else "Zatím nic"
-    worst_text = f"{worst['name']} ({worst['profit']:+} Kč)" if worst else "Zatím nic"
-
-    await ctx.send(
-
-        
-        f"📊 **Stats — {target.display_name}**\n\n"
-        f"🏷️ Level: **{stats_data['level']}**\n"
-        f"💰 Celkový profit: **{stats_data['total_profit']:+} Kč**\n"
-        f"💸 Celkem utraceno: **{stats_data['total_spent']} Kč**\n"
-        f"💵 Celkové tržby: **{stats_data['total_revenue']} Kč**\n"
-        f"📦 Koupeno itemů: **{stats_data['bought_count']}**\n"
-        f"✅ Prodáno itemů: **{stats_data['sold_count']}**\n"
-        f"⏳ Aktuálně drží: **{stats_data['holding_count']}**\n"
-        f"💼 Peníze ve zboží: **{stats_data['money_in_stock']} Kč**\n"
-        f"📈 Průměrný profit/item: **{stats_data['avg_profit']} Kč**\n"
-        f"🏆 Win rate: **{stats_data['win_rate']}%**\n"
-        f"🔥 Největší flip: **{best_text}**\n"
-        f"📉 Nejhorší flip: **{worst_text}**"
-
-        
-    )
-    
-    await update_user_role(ctx, stats_data["total_profit"])
-
-@bot.command()
-async def best(ctx):
-    data = load_flips()
-    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-    sold = [i for i in user["items"] if i["status"] == "sold"]
-
-    if not sold:
-        await ctx.send("Nemáš žádné prodané itemy.")
-        return
-
-    sold.sort(key=lambda x: x["profit"], reverse=True)
-
-    msg = f"🏆 **Top flipy — {ctx.author.display_name}**\n\n"
-
-    for item in sold[:3]:
-        msg += (
-            f"**{item['name']}**\n"
-            f"{item['buy_price']} → {item['sell_price']} Kč "
-            f"(**{item['profit']:+} Kč**)\n\n"
-        )
-
-    await ctx.send(msg)
-
-@bot.command()
-async def leaderboard(ctx):
-    data = load_flips()
-
-    if not data:
-        await ctx.send("Leaderboard je zatím prázdný.")
-        return
-
-    rows = []
-
-    for user_id, user in data.items():
-        stats_data = get_user_stats(user)
-        rows.append({
-            "username": user.get("username", "Unknown"),
-            "profit": stats_data["total_profit"],
-            "sold": stats_data["sold_count"],
-            "level": stats_data["level"]
-        })
-
-    rows.sort(key=lambda x: x["profit"], reverse=True)
-
-    msg = "🏆 **Flipping Leaderboard**\n\n"
-
-    for i, row in enumerate(rows[:10], start=1):
-        msg += (
-            f"`{i}` — **{row['username']}**\n"
-            f"Profit: **{row['profit']:+} Kč** | "
-            f"Sold: **{row['sold']}** | "
-            f"{row['level']}\n\n"
-        )
-
-    await ctx.send(msg)
-
-
-@bot.command()
-async def history(ctx, member: discord.Member = None):
-    target = member or ctx.author
-
-    data = load_flips()
-    user_id = str(target.id)
-
-    if user_id not in data:
-        await ctx.send("Tenhle user ještě nemá historii.")
-        return
-
-    items = data[user_id].get("items", [])
-    sold = [item for item in items if item.get("status") == "sold"]
-
-    if not sold:
-        await ctx.send("Zatím žádné prodané itemy.")
-        return
-
-    sold.sort(key=lambda x: x.get("sold_at", 0), reverse=True)
-
-    msg = f"🧾 **Historie prodejů — {target.display_name}**\n\n"
-
-    for item in sold[:10]:
-        msg += (
-            f"**{item['name']}**\n"
-            f"{item['buy_price']} Kč → {item['sell_price']} Kč "
-            f"(**{item['profit']:+} Kč**)\n\n"
-        )
-
-    await ctx.send(msg)
-
-
-@bot.command()
-async def removeitem(ctx, index: int):
-    data = load_flips()
-    user = ensure_flip_user(data, get_user_id(ctx), get_user_name(ctx))
-
-    holding = [item for item in user.get("items", []) if item.get("status") == "holding"]
-
-    if index < 1 or index > len(holding):
-        await ctx.send("Špatné číslo. Použij `!inventory`.")
-        return
-
-    item_to_remove = holding[index - 1]
-    user["items"].remove(item_to_remove)
-    save_flips(data)
-
-    await ctx.send(f"🗑️ Odebráno z inventory: **{item_to_remove['name']}**")
-
-
-# -------------------------
-# AUTO SCAN
-# -------------------------
 
 @tasks.loop(minutes=CHECK_EVERY_MINUTES)
 async def auto_scan():
@@ -1013,10 +1138,6 @@ async def auto_scan():
             except Exception as e:
                 print(f"Auto scan chyba u usera {user_id}, item {item['keyword']}: {e}")
 
-
-# -------------------------
-# START BOT
-# -------------------------
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("Chybí DISCORD_BOT_TOKEN v Railway Variables")
