@@ -38,6 +38,10 @@ DEFAULT_BLACKLIST = [
 ]
 
 
+# -------------------------
+# JSON
+# -------------------------
+
 def load_json(path, default):
     if not os.path.exists(path):
         save_json(path, default)
@@ -61,6 +65,10 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+
+# -------------------------
+# USERS
+# -------------------------
 
 def load_users():
     return load_json(USERS_FILE, {})
@@ -118,6 +126,10 @@ def ensure_flip_user(data, user_id, username):
     return data[user_id]
 
 
+# -------------------------
+# BAZOS HELPERS
+# -------------------------
+
 def normalize(text):
     return text.lower().strip()
 
@@ -168,7 +180,6 @@ def search_bazos(keyword, max_price, blacklist, limit=50):
     )
 
     headers = {"User-Agent": "Mozilla/5.0"}
-
     response = requests.get(url, headers=headers, timeout=15)
     response.raise_for_status()
 
@@ -221,6 +232,73 @@ def search_bazos(keyword, max_price, blacklist, limit=50):
     return results
 
 
+def estimate_market_price(keyword, blacklist, limit=70):
+    url = (
+        f"https://www.bazos.cz/search.php?"
+        f"hledat={quote_plus(keyword)}"
+        f"&rubriky=www"
+        f"&hlokalita={LOCATION_ZIP}"
+        f"&humkreis={RADIUS_KM}"
+        f"&cenaod="
+        f"&cenado="
+        f"&order="
+    )
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    ads = soup.select(".inzeraty")
+
+    prices = []
+
+    for ad in ads[:limit]:
+        title_tag = ad.select_one(".nadpis a")
+        if not title_tag:
+            continue
+
+        title = title_tag.get_text(strip=True)
+        text = ad.get_text(" ", strip=True)
+
+        desc_tag = ad.select_one(".popis")
+        description = desc_tag.get_text(" ", strip=True) if desc_tag else ""
+
+        full_text = f"{title} {description}"
+
+        if contains_blocked_words(full_text, blacklist):
+            continue
+
+        if not title_matches(title, keyword):
+            continue
+
+        price = extract_price(text)
+
+        if price is None or price <= 0:
+            continue
+
+        prices.append(price)
+
+    if len(prices) < 4:
+        return None
+
+    prices.sort()
+
+    if len(prices) >= 10:
+        cut = max(1, len(prices) // 10)
+        prices = prices[cut:-cut]
+
+    if not prices:
+        return None
+
+    middle = len(prices) // 2
+
+    if len(prices) % 2 == 0:
+        return int((prices[middle - 1] + prices[middle]) / 2)
+
+    return int(prices[middle])
+
+
 def filter_good_deals(ads, expected_sell_price, min_profit):
     safe_sell_price = int(expected_sell_price * 0.9)
     good_deals = []
@@ -254,6 +332,10 @@ async def send_deal(channel, deal):
     )
 
 
+# -------------------------
+# FLIP HELPERS
+# -------------------------
+
 def make_item_id():
     return str(int(time.time() * 1000))
 
@@ -267,10 +349,9 @@ def find_item_by_id(user, item_id):
 
 def find_holding_item(user, query):
     query_l = normalize(query)
-    items = user.get("items", [])
 
     candidates = [
-        item for item in items
+        item for item in user.get("items", [])
         if item.get("status") == "holding"
     ]
 
@@ -385,6 +466,10 @@ def get_user_stats(user):
     }
 
 
+# -------------------------
+# EVENTS
+# -------------------------
+
 @bot.event
 async def on_ready():
     print(f"Bot běží jako {bot.user}")
@@ -405,6 +490,10 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+# -------------------------
+# BASIC
+# -------------------------
+
 @bot.command()
 async def test(ctx):
     await ctx.send("funguje")
@@ -415,7 +504,8 @@ async def helpbot(ctx):
     await ctx.send(
         "**📘 Příkazy bota**\n\n"
         "**Bazoš:**\n"
-        '`!find "název" max_koupě prodej min_profit`\n'
+        '`!find "název"` = auto režim\n'
+        '`!find "název" max_koupě prodej min_profit` = ruční režim\n'
         '`!watch "název" max_koupě prodej min_profit`\n'
         "`!watchlist`\n"
         "`!unwatch číslo`\n\n"
@@ -443,14 +533,84 @@ async def helpbot(ctx):
     )
 
 
+# -------------------------
+# BAZOS COMMANDS
+# -------------------------
+
 @bot.command()
 async def find(ctx, *, args):
     try:
         parts = shlex.split(args)
 
-        if len(parts) < 4:
+        user_settings = ensure_user_settings(get_user_id(ctx), get_user_name(ctx))
+        blacklist = user_settings["blacklist"]
+
+        if len(parts) == 1:
+            keyword = parts[0]
+
             await ctx.send(
-                "Použití:\n"
+                f"🔎 **Auto hledání:** `{keyword}`\n"
+                f"Počítám odhad tržní ceny..."
+            )
+
+            market_price = await asyncio.to_thread(
+                estimate_market_price,
+                keyword,
+                blacklist
+            )
+
+            if market_price is None:
+                await ctx.send(
+                    "❌ Nenašel jsem dost podobných inzerátů pro odhad ceny.\n\n"
+                    "Zkus ruční režim:\n"
+                    f'`!find "{keyword}" max_koupě prodej min_profit`'
+                )
+                return
+
+            safe_sell_price = int(market_price * 0.9)
+            max_buy_price = int(safe_sell_price * 0.75)
+            min_profit = max(300, int(safe_sell_price * 0.18))
+
+            await ctx.send(
+                f"📊 **Auto odhad ceny**\n"
+                f"Produkt: **{keyword}**\n"
+                f"Odhad tržní ceny: **{market_price} Kč**\n"
+                f"Bezpečný prodej: **{safe_sell_price} Kč**\n"
+                f"Max koupě: **{max_buy_price} Kč**\n"
+                f"Min profit: **{min_profit} Kč**"
+            )
+
+            ads = await asyncio.to_thread(
+                search_bazos,
+                keyword,
+                max_buy_price,
+                blacklist
+            )
+
+            good_deals = filter_good_deals(
+                ads,
+                market_price,
+                min_profit
+            )
+
+            if not good_deals:
+                await ctx.send("Nic dobrého jsem nenašel.")
+                return
+
+            await ctx.send(f"🔥 Našel jsem **{len(good_deals)}** auto dealů. Posílám po jednom:")
+
+            for deal in good_deals[:10]:
+                await send_deal(ctx.channel, deal)
+                await asyncio.sleep(1)
+
+            return
+
+        if len(parts) != 4:
+            await ctx.send(
+                "❌ Špatný formát.\n\n"
+                "Auto režim:\n"
+                '`!find "logitech g pro superlight"`\n\n'
+                "Ruční režim:\n"
                 '`!find "logitech g pro superlight" 1200 1700 400`'
             )
             return
@@ -460,13 +620,20 @@ async def find(ctx, *, args):
         expected_sell_price = int(parts[2])
         min_profit = int(parts[3])
 
-        user_settings = ensure_user_settings(get_user_id(ctx), get_user_name(ctx))
-        blacklist = user_settings["blacklist"]
-
         await ctx.send(f"🔎 Hledám pro **{ctx.author.display_name}**: **{keyword}**")
 
-        ads = await asyncio.to_thread(search_bazos, keyword, max_buy_price, blacklist)
-        good_deals = filter_good_deals(ads, expected_sell_price, min_profit)
+        ads = await asyncio.to_thread(
+            search_bazos,
+            keyword,
+            max_buy_price,
+            blacklist
+        )
+
+        good_deals = filter_good_deals(
+            ads,
+            expected_sell_price,
+            min_profit
+        )
 
         if not good_deals:
             await ctx.send("Nic dobrého jsem nenašel.")
@@ -478,6 +645,12 @@ async def find(ctx, *, args):
             await send_deal(ctx.channel, deal)
             await asyncio.sleep(1)
 
+    except ValueError:
+        await ctx.send(
+            "❌ Ceny musí být čísla.\n\n"
+            "Správně:\n"
+            '`!find "logitech g pro superlight" 1200 1700 400`'
+        )
     except Exception as e:
         await ctx.send(f"Chyba: `{e}`")
 
@@ -487,8 +660,11 @@ async def watch(ctx, *, args):
     try:
         parts = shlex.split(args)
 
-        if len(parts) < 4:
-            await ctx.send('Použití: `!watch "logitech g pro superlight" 1200 1700 400`')
+        if len(parts) != 4:
+            await ctx.send(
+                "❌ Špatný formát.\n"
+                'Použij: `!watch "logitech g pro superlight" 1200 1700 400`'
+            )
             return
 
         keyword = parts[0]
@@ -519,6 +695,11 @@ async def watch(ctx, *, args):
             f"prodej {expected_sell_price} Kč | min profit {min_profit} Kč"
         )
 
+    except ValueError:
+        await ctx.send(
+            "❌ Ceny musí být čísla.\n"
+            'Použij: `!watch "logitech g pro superlight" 1200 1700 400`'
+        )
     except Exception as e:
         await ctx.send(f"Chyba: `{e}`")
 
@@ -607,12 +788,16 @@ async def blacklist(ctx, action=None, *, word=None):
     await ctx.send(msg)
 
 
+# -------------------------
+# FLIP COMMANDS
+# -------------------------
+
 @bot.command()
 async def buy(ctx, *, args):
     try:
         parts = shlex.split(args)
 
-        if len(parts) < 2:
+        if len(parts) != 2:
             await ctx.send('Použití: `!buy "Logitech Superlight" 1000`')
             return
 
@@ -645,6 +830,8 @@ async def buy(ctx, *, args):
             f"`!sell \"{name}\" prodejní_cena` + přilož screenshot"
         )
 
+    except ValueError:
+        await ctx.send('❌ Cena musí být číslo. Použij: `!buy "Logitech Superlight" 1000`')
     except Exception as e:
         await ctx.send(f"Chyba: `{e}`")
 
@@ -727,6 +914,8 @@ async def sell(ctx, *, args):
         else:
             await ctx.send(f"⚠️ Admin kanál `{ADMIN_CHANNEL_NAME}` nebyl nalezen.")
 
+    except ValueError:
+        await ctx.send('❌ Cena musí být číslo. Použij: `!sell "Logitech Superlight" 1700` + screenshot')
     except Exception as e:
         await ctx.send(f"Chyba: `{e}`")
 
